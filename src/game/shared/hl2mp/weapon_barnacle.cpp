@@ -209,6 +209,8 @@ static ConVar cl_barnacle_origin_up    ( "cl_barnacle_origin_up",     "-6",   FC
 
 #define BARNACLE_TONGUE_MATERIAL  "sprites/laserbeam"	// no .vmt for materials->FindMaterial
 
+#define BARNACLE_RENDER_PAD       16.0f	// slack added around the path's bounds
+
 class C_BarnacleTongueRenderer;
 #endif // CLIENT_DLL
 
@@ -332,8 +334,8 @@ public:
 
 	// Called by the renderer entity during the render pass.
 	void			DrawTongue( void );
-	bool			GetTongueRenderBounds( Vector &mins, Vector &maxs ) const;
 	bool			IsTongueVisible( void ) const { return m_bTongueActive; }
+	bool			GetTongueRenderBounds( Vector &mins, Vector &maxs ) const;
 
 private:
 	// --- Per-frame driver ------------------------------------------------
@@ -412,7 +414,7 @@ class C_BarnacleTongueRenderer : public C_BaseEntity
 	DECLARE_CLASS( C_BarnacleTongueRenderer, C_BaseEntity );
 
 public:
-	static C_BarnacleTongueRenderer *Create( CWeaponBarnacle *pWeapon )
+	static C_BarnacleTongueRenderer *Create( CWeaponBarnacle *pWeapon, const Vector &vecOrigin )
 	{
 		C_BarnacleTongueRenderer *pRenderer = new C_BarnacleTongueRenderer;
 		if ( !pRenderer )
@@ -427,6 +429,13 @@ public:
 
 		pRenderer->m_hWeapon = pWeapon;
 		pRenderer->AddEffects( EF_NOSHADOW | EF_NORECEIVESHADOW );
+
+		// A real position matters: the leaf system files this renderable into
+		// world leaves by its origin and bounds, and a modelless entity left
+		// at (0,0,0) gets drawn only while the leaf around the world origin is
+		// visible. That is what made the tongue blink out at certain angles.
+		pRenderer->SetAbsOrigin( vecOrigin );
+
 		return pRenderer;
 	}
 
@@ -441,15 +450,36 @@ public:
 		return RENDER_GROUP_TRANSLUCENT_ENTITY;
 	}
 
-	// World-space bounds so the leaf system does not cull the tongue when the
-	// renderer's own origin happens to be outside the view frustum.
-	virtual void GetRenderBoundsWorldspace( Vector &mins, Vector &maxs )
+	// ONE bounds override, deliberately.
+	//
+	// This is the entity-space version, and it is the one that matters:
+	// GetRenderBoundsWorldspace() derives itself from this by default, so
+	// overriding only the world-space version - as an earlier revision did -
+	// leaves the leaf system asking this one and getting a zero-size box. The
+	// tongue then survived only while the leaf around the world origin was on
+	// screen, which is what made it blink out at certain view angles.
+	//
+	// Returned relative to the render origin, which TongueUpdate() keeps on
+	// the centre of the path. Moving the entity is also what re-files it into
+	// the correct leaves: a position change invalidates that registration for
+	// us, so there is no need to poke the leaf system by hand.
+	virtual void GetRenderBounds( Vector &mins, Vector &maxs )
 	{
 		CWeaponBarnacle *pWeapon = m_hWeapon.Get();
-		if ( pWeapon && pWeapon->GetTongueRenderBounds( mins, maxs ) )
-			return;
 
-		mins = maxs = GetAbsOrigin();
+		Vector vecWorldMins, vecWorldMaxs;
+
+		if ( pWeapon && pWeapon->GetTongueRenderBounds( vecWorldMins, vecWorldMaxs ) )
+		{
+			const Vector vecOrigin = GetRenderOrigin();
+
+			mins = vecWorldMins - vecOrigin;
+			maxs = vecWorldMaxs - vecOrigin;
+			return;
+		}
+
+		mins.Init( -BARNACLE_RENDER_PAD, -BARNACLE_RENDER_PAD, -BARNACLE_RENDER_PAD );
+		maxs.Init(  BARNACLE_RENDER_PAD,  BARNACLE_RENDER_PAD,  BARNACLE_RENDER_PAD );
 	}
 
 	virtual int DrawModel( int flags )
@@ -1865,7 +1895,7 @@ void CWeaponBarnacle::TongueStart( C_BasePlayer *pOwner )
 	m_bTongueActive = true;
 
 	if ( !m_hRenderer.Get() )
-		m_hRenderer = C_BarnacleTongueRenderer::Create( this );
+		m_hRenderer = C_BarnacleTongueRenderer::Create( this, m_bWillHit ? m_vecHitPos : m_vecEyeStart );
 
 	// Already attached when we got here: skip the extension animation.
 	if ( m_iState == BARNACLE_ATTACHED || m_iState == BARNACLE_PULLING )
@@ -1938,6 +1968,24 @@ void CWeaponBarnacle::TongueUpdate( C_BasePlayer *pOwner, float dt )
 		UpdatePivots( pOwner, vecEye );
 
 	BuildRenderPath( m_RenderPath );
+
+	// Keep the renderable sitting on the middle of the tongue.
+	//
+	// Two jobs in one assignment. The frustum test reads GetRenderBounds()
+	// fresh every frame, so a correct origin plus real bounds stops the tongue
+	// vanishing when you look away from the world origin. And because a
+	// position change invalidates the entity's leaf registration, the same
+	// call keeps that registration current - no ClientLeafSystem() poking, no
+	// branch-specific API name to get wrong.
+	C_BarnacleTongueRenderer *pRenderer = m_hRenderer.Get();
+
+	if ( pRenderer )
+	{
+		Vector vecMins, vecMaxs;
+
+		if ( GetTongueRenderBounds( vecMins, vecMaxs ) )
+			pRenderer->SetAbsOrigin( ( vecMins + vecMaxs ) * 0.5f );
+	}
 
 	if ( cl_barnacle_debug.GetBool() )
 	{
@@ -2066,6 +2114,8 @@ void CWeaponBarnacle::BuildRenderPath( CUtlVector< Vector > &path ) const
 }
 
 //-----------------------------------------------------------------------------
+// World-space bounds of the drawn path.
+//-----------------------------------------------------------------------------
 bool CWeaponBarnacle::GetTongueRenderBounds( Vector &mins, Vector &maxs ) const
 {
 	if ( m_RenderPath.Count() < 2 )
@@ -2079,7 +2129,10 @@ bool CWeaponBarnacle::GetTongueRenderBounds( Vector &mins, Vector &maxs ) const
 		VectorMax( maxs, m_RenderPath[i], maxs );
 	}
 
-	const Vector vecPad( 16.0f, 16.0f, 16.0f );
+	// Slack for the corner fillets, which bulge slightly outside the polyline,
+	// and for the rendered thickness.
+	const Vector vecPad( BARNACLE_RENDER_PAD, BARNACLE_RENDER_PAD, BARNACLE_RENDER_PAD );
+
 	mins -= vecPad;
 	maxs += vecPad;
 

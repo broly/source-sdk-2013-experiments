@@ -122,6 +122,19 @@ static ConVar sk_barnacle_debug        ( "sk_barnacle_debug",         "0",    FC
 // gibs - one $surfaceprop line in the VMT, no naming convention to remember.
 static ConVar sk_barnacle_organic      ( "sk_barnacle_organic",       "FBHA", FCVAR_NONE, "Surfaceprop material chars the tongue may attach to. Empty = attach to anything." );
 
+// Prey. A barnacle eats things, so a light physics object is a valid target
+// whatever it is made of - a wooden crate reports surfaceprop 'W' and would
+// otherwise be rejected by the organic rule above.
+static ConVar sk_barnacle_eat_props    ( "sk_barnacle_eat_props",     "1",    FCVAR_NONE, "1 = light physics objects are always valid targets, ignoring the surface rule." );
+static ConVar sk_barnacle_grab_mass    ( "sk_barnacle_grab_mass",     "150",  FCVAR_NONE, "Objects at or below this mass get reeled in. Heavier ones pull the player instead." );
+static ConVar sk_barnacle_reel_speed   ( "sk_barnacle_reel_speed",    "600",  FCVAR_NONE, "Speed a reeled object is dragged at (units/sec)." );
+static ConVar sk_barnacle_reel_accel   ( "sk_barnacle_reel_accel",    "2000", FCVAR_NONE, "How fast a reeled object's velocity converges (units/sec^2)." );
+static ConVar sk_barnacle_crush_dist   ( "sk_barnacle_crush_dist",    "72",   FCVAR_NONE, "Distance at which a reeled object is bitten. Too small and the debris spawns behind the camera." );
+static ConVar sk_barnacle_crush_damage ( "sk_barnacle_crush_damage",  "-1",   FCVAR_NONE, "Damage dealt when a reeled object arrives. -1 = exactly lethal for that object, avoiding overkill." );
+static ConVar sk_barnacle_crush_dmgtype( "sk_barnacle_crush_dmgtype", "0",    FCVAR_NONE, "Damage type bits for the bite. 0 = DMG_CLUB." );
+static ConVar sk_barnacle_crush_input  ( "sk_barnacle_crush_input",   "1",    FCVAR_NONE, "1 = bite by firing the target's own Break input and then removing it. 0 = damage only." );
+static ConVar sk_barnacle_crush_force  ( "sk_barnacle_crush_force",   "600",  FCVAR_NONE, "Outward impulse applied to the debris, away from the player." );
+
 // Per-entity tagging without a custom class, using response contexts - the
 // closest thing Source has to Unreal's Tags array. Every CBaseEntity carries a
 // key/value bag, settable in Hammer via the ResponseContext keyvalue and
@@ -304,6 +317,9 @@ private:
 	// --- Helpers --------------------------------------------------------
 	bool			IsSurfaceValid( const trace_t &tr ) const;
 	bool			IsSurfaceOrganic( const trace_t &tr ) const;
+	bool			IsReelableTarget( CBaseEntity *pEnt ) const;
+	void			State_Reeling( CBasePlayer *pOwner, float dt );
+	void			CrushTarget( CBasePlayer *pOwner, CBaseEntity *pTarget );
 	bool			GetAttachWorldPos( Vector &out ) const;
 	bool			IsAttachStillValid( CBasePlayer *pOwner );
 	Vector			GetPullTarget( CBasePlayer *pOwner ) const;
@@ -317,6 +333,7 @@ private:
 
 	Vector			m_vecAttachPoint;		// world-space attach point (static geometry)
 	bool			m_bAttachedToEntity;
+	bool			m_bReelTarget;		// anchor is prey: drag it to us, not us to it
 	EHANDLE			m_hAttachEntity;		// entity we latched onto (may move)
 	Vector			m_vecAttachLocalOffset;	// attach point in entity-local space
 
@@ -520,6 +537,7 @@ CWeaponBarnacle::CWeaponBarnacle( void )
 
 #ifndef CLIENT_DLL
 	m_bAttachedToEntity  = false;
+	m_bReelTarget        = false;
 	m_flClosestDist      = 0.0f;
 	m_flLastProgressTime = 0.0f;
 #endif
@@ -1279,6 +1297,30 @@ bool CWeaponBarnacle::IsSurfaceOrganic( const trace_t &tr ) const
 }
 
 //-----------------------------------------------------------------------------
+// Is this thing prey - something the tongue drags in rather than something the
+// tongue drags us to?
+//
+// Mass is the whole rule, which means a level designer tunes it the way they
+// already tune everything else about a prop. Anything heavier than
+// sk_barnacle_grab_mass simply becomes an anchor instead.
+//-----------------------------------------------------------------------------
+bool CWeaponBarnacle::IsReelableTarget( CBaseEntity *pEnt ) const
+{
+	if ( !pEnt || pEnt->IsWorld() || pEnt->IsPlayer() )
+		return false;
+
+	if ( pEnt->GetMoveType() != MOVETYPE_VPHYSICS )
+		return false;
+
+	IPhysicsObject *pPhys = pEnt->VPhysicsGetObject();
+
+	if ( !pPhys || !pPhys->IsMoveable() )
+		return false;
+
+	return ( pPhys->GetMass() <= sk_barnacle_grab_mass.GetFloat() );
+}
+
+//-----------------------------------------------------------------------------
 // Attach rules, in priority order:
 //
 //   1. never the sky, never the owner
@@ -1327,6 +1369,10 @@ bool CWeaponBarnacle::IsSurfaceValid( const trace_t &tr ) const
 		return true;
 	}
 
+	// Prey is fair game whatever it is made of.
+	if ( sk_barnacle_eat_props.GetBool() && IsReelableTarget( tr.m_pEnt ) )
+		return true;
+
 	if ( !IsSurfaceOrganic( tr ) )
 	{
 		if ( sk_barnacle_debug.GetBool() )
@@ -1353,6 +1399,8 @@ bool CWeaponBarnacle::TryAttach( const trace_t &tr )
 		m_hAttachEntity     = pEnt;
 		VectorITransform( tr.endpos, pEnt->EntityToWorldTransform(), m_vecAttachLocalOffset );
 	}
+
+	m_bReelTarget = IsReelableTarget( pEnt );
 
 	// The anchor is also pivot[0] - the far end of the wrap path. Everything
 	// added after it is a bend between here and the player.
@@ -1531,6 +1579,212 @@ Vector CWeaponBarnacle::GetPullTarget( CBasePlayer *pOwner ) const
 }
 
 //-----------------------------------------------------------------------------
+// REELING: the anchor is prey, so the tongue winches it in.
+//
+// Mirrors State_Pulling deliberately - same clamped velocity steering, same
+// stall guard, same path-aware target - with the roles swapped. Reeling along
+// the bends rather than straight at the player means a crate dragged out of a
+// side passage rounds the corner instead of grinding against its edge, for the
+// same reason the player does.
+//-----------------------------------------------------------------------------
+void CWeaponBarnacle::State_Reeling( CBasePlayer *pOwner, float dt )
+{
+	CBaseEntity *pTarget = m_hAttachEntity.Get();
+
+	if ( !pTarget )
+	{
+		Detach( false );	// already destroyed by something else
+		return;
+	}
+
+	IPhysicsObject *pPhys = pTarget->VPhysicsGetObject();
+
+	if ( !pPhys || !pPhys->IsMoveable() )
+	{
+		Detach( true );		// froze or turned into debris mid-pull
+		return;
+	}
+
+	const bool bWrapped = ( m_Pivots.Count() > 1 );
+
+	const Vector vecDest = bWrapped ? m_Pivots.Tail().vecPos
+									: pOwner->WorldSpaceCenter();
+
+	const Vector vecObject = pTarget->WorldSpaceCenter();
+
+	Vector vecToDest = vecDest - vecObject;
+	const float flDist = VectorNormalize( vecToDest );
+
+	// Arrived at the mouth: bite. Only when the tongue runs straight to us -
+	// while it is still wrapped, the object has only reached a bend.
+	if ( !bWrapped && flDist <= sk_barnacle_crush_dist.GetFloat() )
+	{
+		CrushTarget( pOwner, pTarget );
+		Detach( false );
+		return;
+	}
+
+	// Stall: wedged in a doorway, or something heavy is sitting on it.
+	if ( flDist < m_flClosestDist - 1.0f )
+	{
+		m_flClosestDist      = flDist;
+		m_flLastProgressTime = gpGlobals->curtime;
+	}
+	else if ( gpGlobals->curtime - m_flLastProgressTime > sk_barnacle_stall_time.GetFloat() )
+	{
+		Detach( true );
+		return;
+	}
+
+	// Impulse, NOT SetVelocity().
+	//
+	// Overwriting an object's velocity every tick fights the solver for
+	// control of it. When the solver pushes the object out of a surface it
+	// has penetrated, the next tick writes the old velocity straight back and
+	// drives it in again; at reel speed the object eventually squeezes
+	// through world geometry, and it spends the whole pull in a physics state
+	// nothing else expects. Falling through floors and ending up non-solid
+	// are both that.
+	//
+	// An impulse leaves collision resolution where it belongs. The cost is
+	// that the reel is mass-dependent, so the impulse is scaled by mass to
+	// keep a crate and a barrel coming in at the same rate.
+	Vector vecVel;
+	AngularImpulse angVel;
+	pPhys->GetVelocity( &vecVel, &angVel );
+
+	// Only the component along the pull matters; sideways motion is the
+	// object swinging on the tongue, which is correct and left alone.
+	const float flSpeedAlong = DotProduct( vecVel, vecToDest );
+	const float flTargetSpeed = sk_barnacle_reel_speed.GetFloat();
+
+	if ( flSpeedAlong < flTargetSpeed )
+	{
+		const float flDeltaV = MIN( flTargetSpeed - flSpeedAlong,
+									sk_barnacle_reel_accel.GetFloat() * dt );
+
+		pPhys->Wake();
+		pPhys->ApplyForceCenter( vecToDest * ( flDeltaV * pPhys->GetMass() ) );
+	}
+
+	if ( sk_barnacle_debug.GetBool() )
+		NDebugOverlay::Cross3D( vecObject, 8.0f, 255, 160, 0, true, 0.05f );
+
+	Vector vecAttach;
+	GetAttachWorldPos( vecAttach );
+	UpdateTongueVisual( pOwner, vecAttach );
+}
+
+//-----------------------------------------------------------------------------
+// The bite. Damage rather than outright removal, so the prop breaks the way
+// its own prop_data says it should - gibs, sounds, spawned contents and all.
+//
+// A prop with no health in its model data will survive this. That is the
+// model's business, not the weapon's: give it health in Hammer or pick a
+// breakable model.
+//-----------------------------------------------------------------------------
+void CWeaponBarnacle::CrushTarget( CBasePlayer *pOwner, CBaseEntity *pTarget )
+{
+	if ( !pTarget )
+		return;
+
+	// Nothing touches the target's physics object here.
+	//
+	// An earlier revision damped its velocity first, reasoning that debris
+	// inherits it. Whatever that bought, writing to the physics object of an
+	// entity that is about to be destroyed in the same call is a good way to
+	// leave a half-dead prop behind. If debris ends up flying past the camera,
+	// raise sk_barnacle_crush_dist instead - that is a tuning problem, not a
+	// reason to reach into vphysics.
+
+	// Break, then remove. Both halves, because in this build neither path does
+	// the whole job on its own.
+	//
+	// Verified from the console with no weapon involved:
+	//
+	//   ent_fire prop_physics Break  ->  debris spawns, the prop stays behind
+	//                                    as a non-solid ghost, and firing it
+	//                                    again spawns debris all over again
+	//   damage                       ->  the prop is removed, no debris
+	//
+	// So the Break input runs the model's debris logic but never removes the
+	// prop, and the damage path removes it without running that logic. Firing
+	// the input and then removing the prop composes the two halves that work.
+	//
+	// This is papering over something. The real divergence lives in
+	// src/game/server/props.cpp, between CBreakableProp::InputBreak() /
+	// Break() and CPhysicsProp::Event_Killed() - one has lost its removal, the
+	// other its call into the break logic. Worth fixing there: until it is,
+	// every system in the mod that breaks a prop needs this same workaround,
+	// which is the usual sign the fix belongs upstream rather than here.
+	//
+	// AcceptInput returns false for anything with no Break input, so this
+	// self-selects: breakable props take this path, everything else falls
+	// through to the damage below without a special case.
+	if ( sk_barnacle_crush_input.GetBool() )
+	{
+		variant_t emptyVariant;
+
+		if ( pTarget->AcceptInput( "Break", pOwner, this, emptyVariant, 0 ) )
+		{
+			// UTIL_Remove defers to the end of the frame, so the debris the
+			// input just created is already spawned and survives this.
+			UTIL_Remove( pTarget );
+
+			if ( sk_barnacle_debug.GetBool() )
+				DevMsg( "weapon_barnacle: bit '%s' via Break input, removed\n",
+						pTarget->GetClassname() );
+
+			return;
+		}
+	}
+
+	// Scatter the pieces away from the player rather than through them, so
+	// what does move ends up in view.
+	Vector vecDir = pTarget->WorldSpaceCenter() - pOwner->EyePosition();
+
+	if ( VectorNormalize( vecDir ) < 0.1f )
+		vecDir = Vector( 0.0f, 0.0f, 1.0f );
+
+	// Exactly lethal by default, rather than a fixed large number.
+	//
+	// The test crate reports 80. Hitting it for 200 is overkill, and
+	// breakable debris carries health of its own - enough surplus damage can
+	// take the pieces out in the same breath that created them, which reads in
+	// game as the prop vanishing with only a noise to show for it. Asking the
+	// target how much it needs sidesteps the question entirely.
+	float flDamage = sk_barnacle_crush_damage.GetFloat();
+
+	if ( flDamage < 0.0f )
+		flDamage = ( pTarget->GetHealth() > 0 ) ? ( pTarget->GetHealth() + 1.0f ) : 100.0f;
+
+	// DMG_CRUSH is what physics uses when it squashes something, and props can
+	// treat it specially. A bite is closer to a melee hit, so DMG_CLUB is the
+	// default - the same type the crowbar uses, which does produce debris.
+	int nDamageType = sk_barnacle_crush_dmgtype.GetInt();
+
+	if ( nDamageType == 0 )
+		nDamageType = DMG_CLUB;
+
+	// Inflictor is the player, not the weapon, and the damage position is the
+	// point the tongue actually gripped rather than the middle of the prop.
+	// Both match what a melee hit looks like; a damage position buried inside
+	// the object is degenerate for anything that seeds debris from it.
+	Vector vecAttach;
+	GetAttachWorldPos( vecAttach );
+
+	CTakeDamageInfo info( pOwner, pOwner, flDamage, nDamageType );
+	info.SetDamagePosition( vecAttach );
+	info.SetDamageForce( vecDir * sk_barnacle_crush_force.GetFloat() );
+
+	pTarget->TakeDamage( info );
+
+	if ( sk_barnacle_debug.GetBool() )
+		DevMsg( "weapon_barnacle: bit '%s' (health %d) for %.0f, type %d\n",
+				pTarget->GetClassname(), pTarget->GetHealth(), flDamage, nDamageType );
+}
+
+//-----------------------------------------------------------------------------
 // PULLING: velocity steering with clamped acceleration.
 //
 // Every frame: desired = normalize(attach - player) * pull_speed, then move
@@ -1592,6 +1846,14 @@ void CWeaponBarnacle::State_Pulling( CBasePlayer *pOwner, float dt )
 
 	if ( barnacle_wrap.GetBool() )
 		UpdatePivots( pOwner, vecEye );
+
+	// Prey gets dragged to us instead of us to it. Everything above this line
+	// - validity, cancel, release, wrapping - applies either way.
+	if ( m_bReelTarget )
+	{
+		State_Reeling( pOwner, dt );
+		return;
+	}
 
 	const Vector vecTarget = GetPullTarget( pOwner );
 
@@ -1704,6 +1966,7 @@ void CWeaponBarnacle::Detach( bool bKeepMomentum )
 	m_Pivots.RemoveAll();
 
 	m_bAttachedToEntity = false;
+	m_bReelTarget       = false;
 	m_hAttachEntity     = NULL;
 
 	m_flNextPrimaryAttack = gpGlobals->curtime + BARNACLE_REFIRE_DELAY;

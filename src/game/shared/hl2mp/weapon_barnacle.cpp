@@ -45,6 +45,8 @@
 	#include "hl2mp_player.h"
 	#include "beam_shared.h"
 	#include "ndebugoverlay.h"
+	#include "physics_shared.h"		// physprops
+	#include "engine/IEngineTrace.h"
 #endif
 
 #include "weapon_hl2mpbasehlmpcombatweapon.h"
@@ -109,6 +111,76 @@ static ConVar sk_barnacle_stall_time   ( "sk_barnacle_stall_time",    "1.0",  FC
 static ConVar sk_barnacle_break_on_los ( "sk_barnacle_break_on_los",  "0",    FCVAR_NONE, "1 = tongue snaps when geometry blocks the line to the anchor (pre-wrapping behaviour)." );
 static ConVar sk_barnacle_server_beam  ( "sk_barnacle_server_beam",   "0",    FCVAR_NONE, "1 = draw the legacy straight server beam from the eye. The client draws the real tongue now; this is a fallback only." );
 static ConVar sk_barnacle_debug        ( "sk_barnacle_debug",         "0",    FCVAR_NONE, "1 = draw debug overlays and log state transitions." );
+
+// Which surfaces the tongue can bite into.
+//
+// Matched against surfacedata_t::game.material, the single-character class
+// every surfaceprop carries: F flesh, B bloodyflesh, H alienflesh, A antlion,
+// O foliage, W wood, M metal, C concrete, and so on. Using the surfaceprop
+// rather than the material name means a level designer marks geometry as
+// organic the same way they already control its footsteps, impact effects and
+// gibs - one $surfaceprop line in the VMT, no naming convention to remember.
+static ConVar sk_barnacle_organic      ( "sk_barnacle_organic",       "FBHA", FCVAR_NONE, "Surfaceprop material chars the tongue may attach to. Empty = attach to anything." );
+
+// Per-entity tagging without a custom class, using response contexts - the
+// closest thing Source has to Unreal's Tags array. Every CBaseEntity carries a
+// key/value bag, settable in Hammer via the ResponseContext keyvalue and
+// changeable at runtime through the stock AddContext / RemoveContext /
+// ClearContext inputs. No subclass, no code, no FGD work.
+//
+// Put "barnacle:allow" in any brush entity or prop and the tongue bites it
+// regardless of material; "barnacle:deny" and it never will.
+//
+// OFF BY DEFAULT, deliberately. The exact spelling of the context accessors
+// moves between SDK branches - HasContext(), GetContextValue() and
+// FindContextByName() are not all present everywhere - and a tagging
+// convenience is not worth breaking a build over.
+//
+// To switch it on, find what your branch actually exposes:
+//
+//     findstr /n "Context" src\game\server\baseentity.h
+//
+// then set the define below to 1 and, if needed, adjust the single call in
+// BarnacleGetEntityTag(). Everything else works either way.
+#define BARNACLE_USE_RESPONSE_CONTEXTS  0
+#define BARNACLE_CONTEXT_KEY            "barnacle"
+
+enum BarnacleTag_t
+{
+	BARNACLE_TAG_NONE = 0,
+	BARNACLE_TAG_ALLOW,
+	BARNACLE_TAG_DENY,
+};
+
+//-----------------------------------------------------------------------------
+// Reads the "barnacle" context off an entity.
+//
+// Matched on the first character rather than with a string compare, so that
+// nothing outside the #if depends on any particular string library spelling.
+// "allow" and "deny" are the documented values; anything else is ignored.
+//-----------------------------------------------------------------------------
+static BarnacleTag_t BarnacleGetEntityTag( CBaseEntity *pEnt )
+{
+#if BARNACLE_USE_RESPONSE_CONTEXTS
+	if ( !pEnt )
+		return BARNACLE_TAG_NONE;
+
+	const char *pszValue = pEnt->GetContextValue( BARNACLE_CONTEXT_KEY );
+
+	if ( !pszValue || !pszValue[0] )
+		return BARNACLE_TAG_NONE;
+
+	if ( pszValue[0] == 'd' || pszValue[0] == 'D' )
+		return BARNACLE_TAG_DENY;
+
+	if ( pszValue[0] == 'a' || pszValue[0] == 'A' )
+		return BARNACLE_TAG_ALLOW;
+
+	return BARNACLE_TAG_NONE;
+#else
+	return BARNACLE_TAG_NONE;
+#endif
+}
 
 #define BARNACLE_BEAM_SPRITE   "sprites/laserbeam.vmt"   // stock asset
 #endif
@@ -229,6 +301,7 @@ private:
 
 	// --- Helpers --------------------------------------------------------
 	bool			IsSurfaceValid( const trace_t &tr ) const;
+	bool			IsSurfaceOrganic( const trace_t &tr ) const;
 	bool			GetAttachWorldPos( Vector &out ) const;
 	bool			IsAttachStillValid( CBasePlayer *pOwner );
 	Vector			GetPullTarget( CBasePlayer *pOwner ) const;
@@ -795,6 +868,228 @@ float CWeaponBarnacle::GetTonguePathLength( const Vector &vecHand ) const
 // Everything below is server-only gameplay logic.
 //=============================================================================
 
+//=============================================================================
+//
+// trigger_barnacle_attach
+//
+// A brush volume that changes whether the tongue may bite inside it, and can
+// be switched on and off at runtime.
+//
+// ONE entity covers both roles, chosen by the Mode keyvalue:
+//
+//   Mode 0 (Deny)  - nothing can be attached to inside this volume while the
+//                    volume is enabled, organic or not. This is the lockout.
+//   Mode 1 (Allow) - anything inside may be attached to, bypassing the
+//                    surface material rule. This is the whitelist, for making
+//                    a crate or a pipe grabbable without authoring a VMT.
+//
+// Deny beats Allow when volumes overlap, so a lockout cannot be defeated by
+// stacking a permissive volume on top of it.
+//
+// Design note on why this is a bespoke entity rather than a trigger_multiple:
+// Source triggers are touch-driven, and a tongue impact point is not an
+// entity, so there is nothing to touch them. What is needed is a point query
+// at the moment of attaching, which means keeping a list and testing the
+// point directly. That is what the static registry below is for - there are
+// only ever a handful of these per map, so a linear walk is free.
+//
+// It lives in this file purely so no new source file has to be added to the
+// VPC. Split it out whenever that stops being a convenience.
+//
+//=============================================================================
+enum BarnacleZoneMode_t
+{
+	BARNACLE_ZONE_MODE_DENY = 0,
+	BARNACLE_ZONE_MODE_ALLOW,
+};
+
+enum BarnacleZoneResult_t
+{
+	BARNACLE_ZONE_NONE = 0,		// no volume had an opinion - normal rules apply
+	BARNACLE_ZONE_ALLOW,		// a whitelist volume said yes
+	BARNACLE_ZONE_DENY,			// a lockout volume said no
+};
+
+class CBarnacleAttachZone : public CBaseEntity
+{
+	DECLARE_CLASS( CBarnacleAttachZone, CBaseEntity );
+	DECLARE_DATADESC();
+
+public:
+	virtual void	Spawn( void );
+	virtual void	UpdateOnRemove( void );
+
+	bool			IsActive( void ) const	{ return !m_bDisabled; }
+	int				GetMode( void ) const	{ return m_iMode; }
+	bool			ShouldBreakExisting( void ) const { return m_bBreakExisting; }
+	string_t		GetZoneTag( void ) const { return m_iszZoneTag; }
+
+	bool			ContainsPoint( const Vector &vecPoint );
+
+	void			InputEnable( inputdata_t &inputdata );
+	void			InputDisable( inputdata_t &inputdata );
+	void			InputToggle( inputdata_t &inputdata );
+
+	void			FireAttachEvent( bool bAllowed, CBaseEntity *pActivator );
+
+	static CUtlVector< CBarnacleAttachZone * > s_Zones;
+
+private:
+	bool			m_bDisabled;
+	int				m_iMode;
+	bool			m_bBreakExisting;
+	string_t		m_iszZoneTag;
+
+	COutputEvent	m_OnAttachAllowed;
+	COutputEvent	m_OnAttachBlocked;
+};
+
+CUtlVector< CBarnacleAttachZone * > CBarnacleAttachZone::s_Zones;
+
+LINK_ENTITY_TO_CLASS( trigger_barnacle_attach, CBarnacleAttachZone );
+
+BEGIN_DATADESC( CBarnacleAttachZone )
+	DEFINE_KEYFIELD( m_bDisabled,		FIELD_BOOLEAN,	"StartDisabled" ),
+	DEFINE_KEYFIELD( m_iMode,			FIELD_INTEGER,	"Mode" ),
+	DEFINE_KEYFIELD( m_bBreakExisting,	FIELD_BOOLEAN,	"BreakExisting" ),
+	DEFINE_KEYFIELD( m_iszZoneTag,		FIELD_STRING,	"ZoneTag" ),
+
+	DEFINE_INPUTFUNC( FIELD_VOID, "Enable",  InputEnable ),
+	DEFINE_INPUTFUNC( FIELD_VOID, "Disable", InputDisable ),
+	DEFINE_INPUTFUNC( FIELD_VOID, "Toggle",  InputToggle ),
+
+	DEFINE_OUTPUT( m_OnAttachAllowed, "OnAttachAllowed" ),
+	DEFINE_OUTPUT( m_OnAttachBlocked, "OnAttachBlocked" ),
+END_DATADESC()
+
+void CBarnacleAttachZone::Spawn( void )
+{
+	BaseClass::Spawn();
+
+	// Standard non-solid brush volume: present for point queries, invisible,
+	// and never in the way of anything.
+	SetSolid( SOLID_BSP );
+	AddSolidFlags( FSOLID_NOT_SOLID );
+	SetMoveType( MOVETYPE_NONE );
+	SetModel( STRING( GetModelName() ) );
+	AddEffects( EF_NODRAW );
+
+	if ( s_Zones.Find( this ) == s_Zones.InvalidIndex() )
+		s_Zones.AddToTail( this );
+
+	// Unconditional, but DevMsg only surfaces at developer 1. If a zone is
+	// silently not spawning - wrong classname, brushes stripped at compile,
+	// entity culled - this line is the fastest way to find out.
+	DevMsg( "trigger_barnacle_attach: '%s' spawned, mode %s, %s, model '%s' (%d zones)\n",
+			GetEntityName().ToCStr(),
+			( m_iMode == BARNACLE_ZONE_MODE_DENY ) ? "DENY" : "ALLOW",
+			m_bDisabled ? "disabled" : "active",
+			GetModelName().ToCStr(),
+			s_Zones.Count() );
+}
+
+void CBarnacleAttachZone::UpdateOnRemove( void )
+{
+	s_Zones.FindAndRemove( this );
+	BaseClass::UpdateOnRemove();
+}
+
+//-----------------------------------------------------------------------------
+bool CBarnacleAttachZone::ContainsPoint( const Vector &vecPoint )
+{
+	// A degenerate ray clipped against this entity's own collideable:
+	// startsolid means the point is inside the brush.
+	//
+	// This is exactly how CBaseTrigger::PointIsWithin() does it, and it is
+	// used here for the same reason Valve uses it - unlike a contents query
+	// it does not depend on which compile flags the trigger material ended up
+	// with, and unlike a bounds test it respects the shape the level designer
+	// actually drew.
+	Ray_t ray;
+	trace_t tr;
+
+	ray.Init( vecPoint, vecPoint );
+	enginetrace->ClipRayToCollideable( ray, MASK_ALL, GetCollideable(), &tr );
+
+	return tr.startsolid;
+}
+
+void CBarnacleAttachZone::InputEnable( inputdata_t &inputdata )		{ m_bDisabled = false; }
+void CBarnacleAttachZone::InputDisable( inputdata_t &inputdata )		{ m_bDisabled = true; }
+void CBarnacleAttachZone::InputToggle( inputdata_t &inputdata )		{ m_bDisabled = !m_bDisabled; }
+
+void CBarnacleAttachZone::FireAttachEvent( bool bAllowed, CBaseEntity *pActivator )
+{
+	if ( bAllowed )
+		m_OnAttachAllowed.FireOutput( pActivator, this );
+	else
+		m_OnAttachBlocked.FireOutput( pActivator, this );
+}
+
+//-----------------------------------------------------------------------------
+// Ask every active volume about a point. Deny short-circuits.
+//
+// pFiringZone, if given, receives the volume that decided, so the caller can
+// fire its output without walking the list a second time.
+//-----------------------------------------------------------------------------
+static BarnacleZoneResult_t BarnacleQueryZones( const Vector &vecPoint,
+												bool bBreakingOnly = false,
+												CBarnacleAttachZone **ppDecidingZone = NULL )
+{
+	BarnacleZoneResult_t result = BARNACLE_ZONE_NONE;
+
+	if ( ppDecidingZone )
+		*ppDecidingZone = NULL;
+
+	const bool bDebug = sk_barnacle_debug.GetBool();
+
+	if ( bDebug )
+		DevMsg( "weapon_barnacle: testing point against %d zone(s)\n", CBarnacleAttachZone::s_Zones.Count() );
+
+	for ( int i = 0; i < CBarnacleAttachZone::s_Zones.Count(); ++i )
+	{
+		CBarnacleAttachZone *pZone = CBarnacleAttachZone::s_Zones[i];
+
+		if ( !pZone )
+			continue;
+
+		if ( bDebug )
+		{
+			DevMsg( "  '%s': %s, mode %s, contains point: %s\n",
+					pZone->GetEntityName().ToCStr(),
+					pZone->IsActive() ? "active" : "disabled",
+					( pZone->GetMode() == BARNACLE_ZONE_MODE_DENY ) ? "DENY" : "ALLOW",
+					pZone->ContainsPoint( vecPoint ) ? "YES" : "no" );
+		}
+
+		if ( !pZone->IsActive() )
+			continue;
+
+		// When re-validating an existing tongue we only care about volumes
+		// that are configured to cut one that is already attached.
+		if ( bBreakingOnly && !pZone->ShouldBreakExisting() )
+			continue;
+
+		if ( !pZone->ContainsPoint( vecPoint ) )
+			continue;
+
+		if ( pZone->GetMode() == BARNACLE_ZONE_MODE_DENY )
+		{
+			if ( ppDecidingZone )
+				*ppDecidingZone = pZone;
+
+			return BARNACLE_ZONE_DENY;		// a lockout cannot be outvoted
+		}
+
+		result = BARNACLE_ZONE_ALLOW;
+
+		if ( ppDecidingZone )
+			*ppDecidingZone = pZone;
+	}
+
+	return result;
+}
+
 void CWeaponBarnacle::Drop( const Vector &vecVelocity )
 {
 	Detach( true );
@@ -920,6 +1215,47 @@ void CWeaponBarnacle::State_Firing( CBasePlayer *pOwner, float dt )
 //     whitelist (e.g. only materials under materials/grapple/, via
 //     tr.surface.name) is a one-line change here.
 //-----------------------------------------------------------------------------
+//-----------------------------------------------------------------------------
+// Is this surface organic enough to bite?
+//
+// Read off the surfaceprop, not the material name. Every surfaceprop carries a
+// single-character class in surfacedata_t::game.material, which is what the
+// engine already uses to pick footstep sounds and impact effects - so marking
+// geometry as grabbable is one $surfaceprop line in the VMT, and it stays
+// consistent with how that geometry already behaves.
+//-----------------------------------------------------------------------------
+bool CWeaponBarnacle::IsSurfaceOrganic( const trace_t &tr ) const
+{
+	const char *pszAllowed = sk_barnacle_organic.GetString();
+
+	// Empty list disables the rule entirely - useful while blocking out a map
+	// before any organic materials exist.
+	if ( !pszAllowed || !pszAllowed[0] )
+		return true;
+
+	surfacedata_t *pSurface = physprops->GetSurfaceData( tr.surface.surfaceProps );
+	if ( !pSurface )
+		return false;
+
+	const char chMaterial = pSurface->game.material;
+
+	for ( const char *pszCursor = pszAllowed; *pszCursor; ++pszCursor )
+	{
+		if ( *pszCursor == chMaterial )
+			return true;
+	}
+
+	return false;
+}
+
+//-----------------------------------------------------------------------------
+// Attach rules, in priority order:
+//
+//   1. never the sky, never the owner
+//   2. an active Deny volume vetoes everything
+//   3. an active Allow volume overrides the material rule
+//   4. otherwise the surface must be organic
+//-----------------------------------------------------------------------------
 bool CWeaponBarnacle::IsSurfaceValid( const trace_t &tr ) const
 {
 	if ( tr.surface.flags & SURF_SKY )
@@ -927,6 +1263,47 @@ bool CWeaponBarnacle::IsSurfaceValid( const trace_t &tr ) const
 
 	if ( tr.m_pEnt && tr.m_pEnt == GetOwner() )
 		return false;
+
+	// Per-entity tagging, checked before volumes so a tagged object wins
+	// wherever it happens to be standing. Compiled out unless
+	// BARNACLE_USE_RESPONSE_CONTEXTS is on.
+	const BarnacleTag_t tag = BarnacleGetEntityTag( tr.m_pEnt );
+
+	if ( tag == BARNACLE_TAG_DENY )
+		return false;
+
+	if ( tag == BARNACLE_TAG_ALLOW )
+		return true;
+
+	CBarnacleAttachZone *pZone = NULL;
+	const BarnacleZoneResult_t zone = BarnacleQueryZones( tr.endpos, false, &pZone );
+
+	if ( zone == BARNACLE_ZONE_DENY )
+	{
+		if ( pZone )
+			pZone->FireAttachEvent( false, GetOwner() );
+
+		if ( sk_barnacle_debug.GetBool() )
+			DevMsg( "weapon_barnacle: attach denied by zone\n" );
+
+		return false;
+	}
+
+	if ( zone == BARNACLE_ZONE_ALLOW )
+	{
+		if ( pZone )
+			pZone->FireAttachEvent( true, GetOwner() );
+
+		return true;
+	}
+
+	if ( !IsSurfaceOrganic( tr ) )
+	{
+		if ( sk_barnacle_debug.GetBool() )
+			DevMsg( "weapon_barnacle: surface not organic (%s)\n", tr.surface.name ? tr.surface.name : "?" );
+
+		return false;
+	}
 
 	return true;
 }
@@ -986,6 +1363,17 @@ bool CWeaponBarnacle::IsAttachStillValid( CBasePlayer *pOwner )
 	Vector vecAttach;
 	if ( !GetAttachWorldPos( vecAttach ) )
 		return false;
+
+	// A lockout volume switched on while you are hanging cuts the tongue. That
+	// is the whole point of the button: it has to matter while attached, not
+	// only at the moment of firing.
+	if ( BarnacleQueryZones( vecAttach, true ) == BARNACLE_ZONE_DENY )
+	{
+		if ( sk_barnacle_debug.GetBool() )
+			DevMsg( "weapon_barnacle: anchor entered an active deny zone, releasing\n" );
+
+		return false;
+	}
 
 	const Vector vecEye = pOwner->EyePosition();
 
